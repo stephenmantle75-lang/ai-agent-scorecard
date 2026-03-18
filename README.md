@@ -30,7 +30,7 @@ Score yourself: paste your GitHub username and hit Generate.
 ### 1. Clone
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-agent-scorecard.git
+git clone https://github.com/Mr-Crab-Black/ai-agent-scorecard.git
 cd ai-agent-scorecard
 ```
 
