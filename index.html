@@ -1083,6 +1083,22 @@
         />
         <button onclick="generateScore()" id="generateBtn">Generate Score</button>
       </div>
+      <details id="github-auth-settings" style="margin-top:8px;">
+        <summary style="cursor:pointer;font-size:13px;color:#666;">
+          GitHub Token (optional — increases limit to 5,000/hour)
+        </summary>
+        <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+          <input type="password" id="gh-pat-input" placeholder="ghp_xxxxxxxxxxxx"
+            style="flex:1;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px;" autocomplete="off" />
+          <button id="gh-pat-save" style="padding:6px 12px;font-size:13px;">Save</button>
+          <button id="gh-pat-clear" style="padding:6px 12px;font-size:13px;color:#c00;">Clear</button>
+        </div>
+        <p id="gh-pat-status" style="font-size:12px;color:#888;margin:4px 0 0;"></p>
+      </details>
+      <div id="quota-indicator" style="font-size:12px;color:#888;margin-top:6px;display:none;">
+        GitHub API: <span id="quota-remaining">—</span>/<span id="quota-limit">—</span> calls remaining
+        <span id="quota-reset-time" style="margin-left:6px;"></span>
+      </div>
     </div>
 
     <div class="loading" id="loading">⏳ Fetching GitHub data...</div>
@@ -1315,6 +1331,55 @@
 
     const API_TIMEOUT = 10000; // 10 second timeout
 
+    // Rate Limiting Error Class
+    class RateLimitError extends Error {
+      constructor(message) {
+        super(message);
+        this.name = 'RateLimitError';
+      }
+    }
+
+    // Rate Limit State Management
+    const RateLimitState = {
+      remaining: null,
+      limit: null,
+      resetTimestamp: null,
+      token: localStorage.getItem('gh_pat') || null,
+
+      setFromHeaders(headers) {
+        const r = headers.get('X-RateLimit-Remaining');
+        const l = headers.get('X-RateLimit-Limit');
+        const t = headers.get('X-RateLimit-Reset');
+        if (r !== null) this.remaining = parseInt(r, 10);
+        if (l !== null) this.limit = parseInt(l, 10);
+        if (t !== null) this.resetTimestamp = parseInt(t, 10);
+        this.updateDisplay();
+      },
+
+      getResetTimeString() {
+        if (!this.resetTimestamp) return 'unknown';
+        const d = new Date(this.resetTimestamp * 1000);
+        const mins = Math.ceil((d - Date.now()) / 60000);
+        return mins <= 1 ? 'less than 1 minute' : `~${mins} minutes (${d.toLocaleTimeString()})`;
+      },
+
+      hasQuotaFor(callsNeeded) {
+        if (this.remaining === null) return true; // unknown — allow first call
+        return this.remaining >= callsNeeded;
+      },
+
+      saveToken(pat) {
+        this.token = pat ? pat.trim() : null;
+        this.token ? localStorage.setItem('gh_pat', this.token) : localStorage.removeItem('gh_pat');
+        this.remaining = null;
+        this.limit = null;
+        this.resetTimestamp = null;
+        this.updateDisplay();
+      },
+
+      updateDisplay() {} // wired to DOM in initRateLimitUI()
+    };
+
     // Utility: Escape HTML to prevent XSS
     function escapeHtml(unsafe) {
       if (!unsafe) return '';
@@ -1326,21 +1391,55 @@
         .replace(/'/g, '&#039;');
     }
 
-    // Utility: Fetch with timeout
-    async function fetchWithTimeout(url, options = {}, timeout = API_TIMEOUT) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
+    // Utility: Fetch with retry, auth, and rate-limit handling
+    async function fetchWithRetry(url, options = {}, maxRetries = 3) {
+      const headers = { ...options.headers };
+      if (RateLimitState.token) headers['Authorization'] = `Bearer ${RateLimitState.token}`;
 
-      try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        clearTimeout(timeoutId);
-        return response;
-      } catch (error) {
-        clearTimeout(timeoutId);
-        if (error.name === 'AbortError') {
-          throw new Error('Request timeout: GitHub API took too long to respond');
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT);
+
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          const response = await fetch(url, { ...options, headers, signal: controller.signal });
+          RateLimitState.setFromHeaders(response.headers);
+
+          if (response.status === 403) {
+            clearTimeout(timeoutId);
+            const body = await response.json().catch(() => ({}));
+            if (body.message?.toLowerCase().includes('rate limit')) {
+              throw new RateLimitError(`GitHub API rate limit exceeded. Resets in ${RateLimitState.getResetTimeString()}.`);
+            }
+            if (body.message?.toLowerCase().includes('bad credential')) {
+              throw new Error('GitHub token invalid or expired. Clear it and try again.');
+            }
+            throw new Error(body.message || 'GitHub API returned 403 Forbidden');
+          }
+
+          if (response.status >= 500 && attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 1000));
+            continue;
+          }
+
+          clearTimeout(timeoutId);
+          return response;
+
+        } catch (err) {
+          if (err instanceof RateLimitError) {
+            clearTimeout(timeoutId);
+            throw err;
+          }
+          if (err.name === 'AbortError') {
+            clearTimeout(timeoutId);
+            throw new Error('Request timeout: GitHub API took too long to respond');
+          }
+          if (attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 1000));
+            continue;
+          }
+          clearTimeout(timeoutId);
+          throw err;
         }
-        throw error;
       }
     }
 
@@ -1375,6 +1474,13 @@
           throw new Error('Invalid GitHub repo name format');
         }
 
+        // Pre-flight quota check
+        const callsNeeded = repo ? 2 : 5; // repo mode: 2 calls; user mode: 2 + 3 = 5 calls
+        if (!RateLimitState.hasQuotaFor(callsNeeded)) {
+          showError(`Not enough GitHub API quota. ${RateLimitState.remaining} calls left, need ${callsNeeded}. Resets in ${RateLimitState.getResetTimeString()}.`);
+          return;
+        }
+
         const data = await fetchGitHubData(username, repo);
         console.log('DIAGNOSTIC: fetchGitHubData result:', { reposCount: data.repos.length, commitsCount: data.commits.length, type: data.type });
         console.log('DIAGNOSTIC: repos data:', data.repos.map(r => ({ name: r.name, language: r.language, stargazers_count: r.stargazers_count })));
@@ -1394,8 +1500,12 @@
         // Always refresh leaderboard after scoring
         setTimeout(loadLeaderboard, 500);
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'An unknown error occurred';
-        showError(sanitizeErrorMessage(message));
+        if (error instanceof RateLimitError) {
+          showError(error.message);
+        } else {
+          const message = error instanceof Error ? error.message : 'An unknown error occurred';
+          showError(sanitizeErrorMessage(message));
+        }
       } finally {
         showLoading(false);
         button.disabled = false;
@@ -1438,8 +1548,8 @@
           const commitsUrl = `${repoUrl}/commits?per_page=100`;
 
           const [repoResp, commitsResp] = await Promise.all([
-            fetchWithTimeout(repoUrl, { headers }),
-            fetchWithTimeout(commitsUrl, { headers })
+            fetchWithRetry(repoUrl, { headers }),
+            fetchWithRetry(commitsUrl, { headers })
           ]);
 
           const repoData = await repoResp.json();
@@ -1461,8 +1571,8 @@
           const reposUrl = `${userUrl}/repos?per_page=100&sort=updated`;
 
           const [userResp, reposResp] = await Promise.all([
-            fetchWithTimeout(userUrl, { headers }),
-            fetchWithTimeout(reposUrl, { headers })
+            fetchWithRetry(userUrl, { headers }),
+            fetchWithRetry(reposUrl, { headers })
           ]);
 
           const userData = await userResp.json();
@@ -1483,7 +1593,7 @@
 
           for (const r of topRepos) {
             try {
-              const commitsResp = await fetchWithTimeout(`${r.url}/commits?per_page=50`, { headers });
+              const commitsResp = await fetchWithRetry(`${r.url}/commits?per_page=50`, { headers });
               const commits = await commitsResp.json();
               if (Array.isArray(commits)) {
                 allCommits.push(...commits);
@@ -1497,6 +1607,9 @@
           return { repos: reposData || [], commits: allCommits, type: 'user' };
         }
       } catch (error) {
+        if (error instanceof RateLimitError) {
+          throw error;
+        }
         if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
           throw new Error('Network error: Could not reach GitHub API. Check your internet connection.');
         }
@@ -2009,7 +2122,46 @@ Tier: ${tier}
       });
     }
 
+    // Initialize Rate Limit UI
+    function initRateLimitUI() {
+      const patInput = document.getElementById('gh-pat-input');
+      const patStatus = document.getElementById('gh-pat-status');
+
+      if (RateLimitState.token) {
+        patInput.value = '••••••••••••';
+        patStatus.textContent = 'Token saved. Using authenticated limit (5,000/hour).';
+      }
+
+      document.getElementById('gh-pat-save').addEventListener('click', () => {
+        const val = patInput.value.trim();
+        if (!val || val === '••••••••••••') return;
+        RateLimitState.saveToken(val);
+        patInput.value = '••••••••••••';
+        patStatus.textContent = 'Token saved. Using authenticated limit (5,000/hour).';
+      });
+
+      document.getElementById('gh-pat-clear').addEventListener('click', () => {
+        RateLimitState.saveToken(null);
+        patInput.value = '';
+        patStatus.textContent = 'Token cleared. Using unauthenticated limit (60/hour).';
+      });
+
+      RateLimitState.updateDisplay = function() {
+        if (this.remaining === null) return;
+        document.getElementById('quota-remaining').textContent = this.remaining;
+        document.getElementById('quota-limit').textContent = this.limit || '—';
+        if (this.resetTimestamp) {
+          document.getElementById('quota-reset-time').textContent =
+            `(resets at ${new Date(this.resetTimestamp * 1000).toLocaleTimeString()})`;
+        }
+        const el = document.getElementById('quota-indicator');
+        el.style.display = 'block';
+        el.style.color = this.remaining < 10 ? '#c00' : '#888';
+      };
+    }
+
     // Init
+    initRateLimitUI();
     loadLeaderboard();
     checkShareUrl();
   </script>
